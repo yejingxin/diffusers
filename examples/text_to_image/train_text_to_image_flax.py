@@ -1,3 +1,15 @@
+"""
+python3 train_text_to_image_flax.py \
+  --pretrained_model_name_or_path="duongna/stable-diffusion-v1-4-flax" \
+  --dataset_name="lambdalabs/pokemon-blip-captions" \
+  --resolution=512 --center_crop --random_flip \
+  --train_batch_size=1 \
+  --mixed_precision="fp16" \
+  --max_train_steps=100 \
+  --learning_rate=1e-05 \
+  --max_grad_norm=1 \
+  --output_dir="gs://yejingxin-us-central2/hf_sd_flax/sd-pokemon-model_2023040801" 
+"""
 import argparse
 import logging
 import math
@@ -380,6 +392,7 @@ def main():
     text_encoder = FlaxCLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, revision=args.revision, subfolder="text_encoder", dtype=weight_dtype
     )
+    text_encoder_params = text_encoder.params #parameters()
     vae, vae_params = FlaxAutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path, revision=args.revision, subfolder="vae", dtype=weight_dtype
     )
@@ -401,12 +414,22 @@ def main():
         weight_decay=args.adam_weight_decay,
     )
 
-    optimizer = optax.chain(
+    optimizer_unet = optax.chain(
+        optax.clip_by_global_norm(args.max_grad_norm),
+        adamw,
+    )
+    optimizer_vae = optax.chain(
+        optax.clip_by_global_norm(args.max_grad_norm),
+        adamw,
+    )
+    optimizer_text_encoder = optax.chain(
         optax.clip_by_global_norm(args.max_grad_norm),
         adamw,
     )
 
-    state = train_state.TrainState.create(apply_fn=unet.__call__, params=unet_params, tx=optimizer)
+    unet_state = train_state.TrainState.create(apply_fn=unet.__call__, params=unet_params, tx=optimizer_unet)
+    vae_state = train_state.TrainState.create(apply_fn=vae.encode, params=vae_params, tx=optimizer_vae)
+    text_encoder_state = train_state.TrainState.create(apply_fn=text_encoder.__call__, params=text_encoder_params, tx=optimizer_text_encoder)
 
     noise_scheduler = FlaxDDPMScheduler(
         beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000
@@ -417,10 +440,10 @@ def main():
     rng = jax.random.PRNGKey(args.seed)
     train_rngs = jax.random.split(rng, jax.local_device_count())
 
-    def train_step(state, text_encoder_params, vae_params, batch, train_rng):
+    def train_step(unet_state, text_encoder_state, vae_state, batch, train_rng):
         dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng, 3)
 
-        def compute_loss(params):
+        def compute_loss(unet_params, text_encoder_params, vae_params):
             # Convert images to latent space
             vae_outputs = vae.apply(
                 {"params": vae_params}, batch["pixel_values"], deterministic=True, method=vae.encode
@@ -455,7 +478,7 @@ def main():
 
             # Predict the noise residual and compute loss
             model_pred = unet.apply(
-                {"params": params}, noisy_latents, timesteps, encoder_hidden_states, train=True
+                {"params": unet_params}, noisy_latents, timesteps, encoder_hidden_states, train=True
             ).sample
 
             # Get the target for loss depending on the prediction type
@@ -471,24 +494,28 @@ def main():
 
             return loss
 
-        grad_fn = jax.value_and_grad(compute_loss)
-        loss, grad = grad_fn(state.params)
-        grad = jax.lax.pmean(grad, "batch")
+        grad_fn = jax.value_and_grad(compute_loss, argnums=(0, 1, 2))
+        loss, (unet_grad, text_encoder_grad, vae_grad) = grad_fn(unet_state.params, text_encoder_state.params, vae_state.params)
+        unet_grad = jax.lax.pmean(unet_grad, "batch")
+        text_encoder_grad = jax.lax.pmean(text_encoder_grad, "batch")
+        vae_grad = jax.lax.pmean(vae_grad, "batch")
 
-        new_state = state.apply_gradients(grads=grad)
+        new_unet_state = unet_state.apply_gradients(grads=unet_grad)
+        new_text_encoder_state = text_encoder_state.apply_gradients(grads=text_encoder_grad)
+        new_vae_state = vae_state.apply_gradients(grads=vae_grad)
 
         metrics = {"loss": loss}
         metrics = jax.lax.pmean(metrics, axis_name="batch")
 
-        return new_state, metrics, new_train_rng
+        return new_unet_state, new_text_encoder_state, new_vae_state, metrics, new_train_rng
 
     # Create parallel version of the train step
     p_train_step = jax.pmap(train_step, "batch", donate_argnums=(0,))
 
     # Replicate the train state on each device
-    state = jax_utils.replicate(state)
-    text_encoder_params = jax_utils.replicate(text_encoder.params)
-    vae_params = jax_utils.replicate(vae_params)
+    unet_state = jax_utils.replicate(unet_state)
+    text_encoder_state = jax_utils.replicate(text_encoder_state)
+    vae_state = jax_utils.replicate(vae_state)
 
     # Train!
     num_update_steps_per_epoch = math.ceil(len(train_dataloader))
@@ -519,7 +546,7 @@ def main():
         # train
         for batch in train_dataloader:
             batch = shard(batch)
-            state, train_metric, train_rngs = p_train_step(state, text_encoder_params, vae_params, batch, train_rngs)
+            unet_state, text_encoder_state, vae_state, train_metric, train_rngs = p_train_step(unet_state, text_encoder_state, vae_state, batch, train_rngs)
             train_metrics.append(train_metric)
 
             train_step_progress_bar.update(1)
@@ -554,9 +581,9 @@ def main():
         pipeline.save_pretrained(
             args.output_dir,
             params={
-                "text_encoder": get_params_to_save(text_encoder_params),
-                "vae": get_params_to_save(vae_params),
-                "unet": get_params_to_save(state.params),
+                "text_encoder": get_params_to_save(text_encoder_state.params),
+                "vae": get_params_to_save(vae_state.params),
+                "unet": get_params_to_save(unet_state.params),
                 "safety_checker": safety_checker.params,
             },
         )
